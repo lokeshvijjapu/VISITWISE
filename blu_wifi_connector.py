@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# give the ssid and password in the format SSID++++Password
 
 import dbus
 import dbus.mainloop.glib
