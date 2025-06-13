@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# use to check the ble if we enter any msg through ble (nrf) it appears 
 
 import dbus
 import dbus.mainloop.glib
