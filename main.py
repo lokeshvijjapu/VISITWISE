@@ -1,4 +1,5 @@
 #final.py
+# This script captures video from a Raspberry Pi camera, detects motion, records video clips, and uploads them to a specified API endpoint.
 
 # -*- coding: utf-8 -*-
 import sdnotify
