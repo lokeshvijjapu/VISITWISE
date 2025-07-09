@@ -1,9 +1,4 @@
-#final.py
-# This script captures video from a Raspberry Pi camera, detects motion, records video clips, and uploads them to a specified API endpoint.
-
-# -*- coding: utf-8 -*-
-import sdnotify
-notifier = sdnotify.SystemdNotifier()
+# its working code of motion detection
 
 import cv2
 import numpy as np
@@ -16,20 +11,21 @@ import time
 import os
 import getpass
 import threading
-import subprocess
 from libcamera import Transform
 
 # Configuration
 DEVICE_ID = "DEV3617"  # Replace with your device ID
-API_URL = "https://visit-wise-llm.jayaprakash.cloud/upload-video"
-#API_URL = "http://192.168.31.210:10101/upload-video"
+API_URL = "https://visit-wise-llm.onrender.com/upload-video/"
 VIDEO_DURATION = 5  # seconds
 MOTION_THRESHOLD = 40  # Sensitivity for motion detection
+#MIN_MOTION_AREA = 1500  # Increased for 720p resolution
 MIN_MOTION_AREA = 500  # Increased for 480p resolution
 OUTPUT_DIR = f"/home/{getpass.getuser()}/videos"
 COOLDOWN_PERIOD = 5  # seconds to wait after recording
 UPLOAD_TIMEOUT = 20  # seconds for upload timeout
+#VIDEO_RESOLUTION = (640, 480)  # 480p resolution
 VIDEO_RESOLUTION = (1280, 1080)  # 720p resolution
+
 FRAME_RATE = 60
 ROTATION = Transform(rotation=-270)  # Rotate 90 degrees clockwise
 
@@ -48,7 +44,7 @@ def ensure_output_directory():
         return False
 
 def upload_video(video_path):
-    """Upload video to API and delete local files after successful upload."""
+    """Upload video to API with timeout."""
     try:
         with open(video_path, 'rb') as video_file:
             files = {'file': (os.path.basename(video_path), video_file, 'video/mp4')}
@@ -57,33 +53,19 @@ def upload_video(video_path):
             response = requests.post(API_URL, files=files, params=params, timeout=UPLOAD_TIMEOUT)
             if response.status_code == 200:
                 print(f"Video uploaded successfully: {video_path}")
-                time.sleep(0.5)  # Ensure file handles are released
-
-                # Try deleting both mp4 and h264
-            for file_path in [video_path, video_path.replace('.mp4', '.h264')]:
-                retry_count = 3
-                while retry_count > 0:
-                    try:
-                        if os.path.exists(file_path):
-                            os.chmod(file_path, 0o666)  # Ensure write permissions
-                            subprocess.run(['sudo', 'rm', '-f', file_path], check=True)
-                            print(f"Deleted local file: {file_path}")
-                            break
-                        else:
-                            print(f"File not found for deletion: {file_path}")
-                            break
-                    except PermissionError as pe:
-                        print(f"Permission error deleting {file_path}: {str(pe)}")
-                    except OSError as oe:
-                        print(f"OS error deleting {file_path}: {str(oe)}")
-                    except Exception as e:
-                        print(f"Unexpected error deleting {file_path}: {str(e)}")
-                    retry_count -= 1
-                    time.sleep(1)
-
-                if retry_count == 0:
-                    print(f"Failed to delete {file_path} after retries")
-            return True
+                try:
+                    os.remove(video_path)
+                    h264_path = video_path.replace('.mp4', '.h264')
+                    if os.path.exists(h264_path):
+                        os.remove(h264_path)
+                    print(f"Deleted local files: {video_path}, {h264_path}")
+                except Exception as e:
+                    print(f"Error deleting local files: {str(e)}")
+		   # print(f"Upload successful: Status {response.status_code}, {response.text}")
+                return True
+            else:
+                print(f"Upload failed: Status {response.status_code}, {response.text}")
+                return False
     except requests.exceptions.RequestException as e:
         print(f"Upload error: {str(e)}")
         return False
@@ -99,14 +81,13 @@ def record_and_convert(picam2, encoder, video_path):
         picam2.start_encoder(encoder, output)
         time.sleep(VIDEO_DURATION)
         picam2.stop_encoder()
-        output.close()  # Explicitly close the output file
         print(f"Recording stopped: {video_path}")
         
         mp4_path = video_path.replace('.h264', '.mp4')
-        command = ["ffmpeg", "-y", "-i", video_path, "-c:v", "copy", "-c:a", "aac", mp4_path]
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"FFmpeg conversion failed for {video_path}: {result.stderr}")
+        command = f"ffmpeg -y -i {video_path} -c:v copy -c:a aac {mp4_path}"
+        result = os.system(command)
+        if result != 0:
+            print(f"FFmpeg conversion failed for {video_path}")
             return None
         print(f"Converted to MP4: {mp4_path}")
         return mp4_path
@@ -189,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    #end
