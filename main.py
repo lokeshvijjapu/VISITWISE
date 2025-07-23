@@ -1,196 +1,202 @@
-#!/usr/bin/env python3
+#final.py
 # -*- coding: utf-8 -*-
-"""
-Raspberry Pi motion-triggered video recorder with auto cleanup,
-corrupt file handling, and automatic reboot logic.
-"""
-import os
-import time
-import signal
-import getpass
-import threading
-import subprocess
-from datetime import datetime
-from queue import Queue, Empty
-from concurrent.futures import ThreadPoolExecutor
+# This script captures video from a Raspberry Pi camera, detects motion,
+# records video clips, and uploads them to a specified API endpoint.
 
 import sdnotify
-import requests
+notifier = sdnotify.SystemdNotifier()
+
 import cv2
 import numpy as np
+import requests
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
+from datetime import datetime
+import time
+import os
+import getpass
+import threading
+import subprocess
 from libcamera import Transform
 
-# ------------- Configuration -------------
-VIDEO_DURATION   = 5
-VIDEO_RESOLUTION = (1280, 1080)
-FRAME_RATE       = 60
-MOTION_THRESHOLD = 30
-MIN_MOTION_AREA  = 500
-OUTPUT_DIR       = f"/home/{getpass.getuser()}/videos"
-ROTATION         = Transform(rotation=-270)
-
-CLEANUP_TTL      = 60
-CLEANUP_INTERVAL = 30
-
-DEVICE_ID_FILE   = '/home/neonflake/Desktop/visitwise/device_id.txt'
-MAX_CORRUPT_COUNT = 3
-MAX_IDLE_SECONDS = 1800  # 30 minutes
-
-notifier = sdnotify.SystemdNotifier()
-motion_queue = Queue()
-upload_executor = ThreadPoolExecutor()
-
-picam2 = None
-last_success_time = time.time()
-corrupt_count = 0
-
-# ------------- Graceful Shutdown -------------
-def shutdown(signum, frame):
+# Configuration
+def load_device_id():
+    """Load Device ID from file written by BLE provisioning."""
     try:
-        picam2.stop()
-        picam2.close()
-    except:
-        pass
-    notifier.notify("STOPPING=1")
-    exit(0)
+        path = "/home/neonflake/Desktop/visitwise/device_id.txt"
+        with open(path, 'r') as f:
+            device_id = f.read().strip()
+            if device_id:
+                print(f"Loaded Device ID: {device_id}")
+                return device_id
+            else:
+                print("Device ID file is empty. Using default.")
+    except Exception as e:
+        print(f"Could not load Device ID: {e}")
+    return "DEV_DEFAULT"
 
-signal.signal(signal.SIGTERM, shutdown)
-signal.signal(signal.SIGINT, shutdown)
-
-# ------------- Utility Functions -------------
-def reboot():
-    os.system("sudo reboot")
-
-def get_device_id():
-    try:
-        with open(DEVICE_ID_FILE, 'r') as f:
-            return f.read().strip()
-    except:
-        return 'DEV_DEFAULT'
+DEVICE_ID = load_device_id()
+API_URL = "https://visit-wise-llm.jayaprakash.cloud/upload-video"
+VIDEO_DURATION = 5  # seconds
+MOTION_THRESHOLD = 40  # Sensitivity for motion detection
+MIN_MOTION_AREA = 500  # Minimum area of motion to trigger recording
+OUTPUT_DIR = f"/home/{getpass.getuser()}/videos"
+COOLDOWN_PERIOD = 5  # seconds to wait after recording
+UPLOAD_TIMEOUT = 30  # seconds for upload timeout
+VIDEO_RESOLUTION = (1280, 720)  # 720p resolution
+FRAME_RATE = 30
+ROTATION = Transform(rotation=-270)  # Rotate 90 degrees clockwise
 
 def ensure_output_directory():
+    """Ensure the output directory exists and is writable."""
     try:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        test_file = os.path.join(OUTPUT_DIR, ".test_write")
+        with open(test_file, 'w') as f:
+            f.write("test")
+        os.remove(test_file)
+        print("Output directory verified")
         return True
-    except:
+    except Exception as e:
+        print(f"Error: Cannot write to output directory {OUTPUT_DIR}: {str(e)}")
         return False
 
-def cleanup_worker():
-    while True:
-        cutoff = time.time() - CLEANUP_TTL
-        for fname in os.listdir(OUTPUT_DIR):
-            path = os.path.join(OUTPUT_DIR, fname)
-            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
-                try:
-                    os.remove(path)
-                except:
-                    pass
-        time.sleep(CLEANUP_INTERVAL)
-
-def upload_video(path):
-    device_id = get_device_id()
+def upload_video(video_path):
+    """Upload video to API and delete local files after successful upload."""
     try:
-        with open(path, 'rb') as vf:
-            files = {'file': (os.path.basename(path), vf, 'video/mp4')}
-            params = {'deviceId': device_id}
-            requests.post('https://visit-wise-llm.jayaprakash.cloud/upload-video',
-                          files=files, params=params, timeout=20)
-    except:
-        pass
+        with open(video_path, 'rb') as video_file:
+            files = {'file': (os.path.basename(video_path), video_file, 'video/mp4')}
+            params = {'deviceId': DEVICE_ID}
+            print(f"Uploading video: {video_path}")
+            response = requests.post(API_URL, files=files, params=params, timeout=UPLOAD_TIMEOUT)
+            if response.status_code == 200:
+                print(f"Video uploaded successfully: {video_path}")
+                time.sleep(0.5)  # Ensure file handles are released
 
-def record_clip(picam2, encoder):
-    global last_success_time, corrupt_count
+                # Delete both .mp4 and .h264 files
+                for file_path in [video_path, video_path.replace('.h264', '.mp4')]:
+                    retry_count = 3
+                    while retry_count > 0:
+                        try:
+                            if os.path.exists(file_path):
+                                os.chmod(file_path, 0o666)
+                                subprocess.run(['sudo', 'rm', '-f', file_path], check=True)
+                                print(f"Deleted local file: {file_path}")
+                                break
+                            else:
+                                print(f"File not found for deletion: {file_path}")
+                                break
+                        except PermissionError as pe:
+                            print(f"Permission error deleting {file_path}: {str(pe)}")
+                        except OSError as oe:
+                            print(f"OS error deleting {file_path}: {str(oe)}")
+                        except Exception as e:
+                            print(f"Unexpected error deleting {file_path}: {str(e)}")
+                        retry_count -= 1
+                        time.sleep(1)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-    raw = os.path.join(OUTPUT_DIR, f"motion_{timestamp}.h264")
-    mp4 = raw.replace('.h264', '.mp4')
+                    if retry_count == 0:
+                        print(f"Failed to delete {file_path} after retries")
+                return True
+            else:
+                print(f"Upload failed with status code {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"Upload error: {str(e)}")
+    except Exception as e:
+        print(f"Unexpected error during upload: {str(e)}")
+    return False
 
+def record_and_convert(picam2, encoder, video_path):
+    """Record video and convert to MP4 using ffmpeg."""
     try:
-        out = FileOutput(raw)
-        picam2.start_encoder(encoder, out)
+        output = FileOutput(video_path)
+        print(f"Starting recording: {video_path}")
+        picam2.start_encoder(encoder, output)
         time.sleep(VIDEO_DURATION)
         picam2.stop_encoder()
-        out.close()
+        output.close()
+        print(f"Recording stopped: {video_path}")
 
-        if os.path.getsize(raw) < 5000:
-            corrupt_count += 1
-            os.remove(raw)
-            if corrupt_count >= MAX_CORRUPT_COUNT:
-                reboot()
+        mp4_path = video_path.replace('.h264', '.mp4')
+        command = ["ffmpeg", "-y", "-i", video_path, "-c:v", "copy", "-c:a", "aac", mp4_path]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"FFmpeg conversion failed for {video_path}: {result.stderr}")
             return None
-
-        cmd = ["ffmpeg", "-y", "-i", raw, "-c:v", "copy", "-c:a", "aac", mp4]
-        subprocess.run(cmd, capture_output=True)
-        os.remove(raw)
-        last_success_time = time.time()
-        corrupt_count = 0
-        return mp4
-
-    except:
+        print(f"Converted to MP4: {mp4_path}")
+        return mp4_path
+    except Exception as e:
+        print(f"Recording/conversion error: {str(e)}")
         return None
 
-def motion_worker(picam2, encoder):
-    while True:
-        try:
-            motion_queue.get(timeout=1)
-            clip = record_clip(picam2, encoder)
-            if clip:
-                upload_executor.submit(upload_video, clip)
-        except Empty:
-            continue
-
-def idle_monitor():
-    while True:
-        if time.time() - last_success_time > MAX_IDLE_SECONDS:
-            reboot()
-        time.sleep(60)
+def handle_motion(picam2, encoder, video_path):
+    """Handle motion: record and upload."""
+    mp4_path = record_and_convert(picam2, encoder, video_path)
+    if mp4_path:
+        upload_video(mp4_path)
 
 def main():
-    global picam2
-
     if not ensure_output_directory():
+        print("Exiting due to output directory issues.")
         return
 
     picam2 = Picamera2()
-    cfg = picam2.create_video_configuration(
+    video_config = picam2.create_video_configuration(
         main={"size": VIDEO_RESOLUTION, "format": "YUV420"},
         transform=ROTATION
     )
-    picam2.configure(cfg)
+    picam2.configure(video_config)
     encoder = H264Encoder()
     picam2.start()
 
-    threading.Thread(target=cleanup_worker, daemon=True).start()
-    threading.Thread(target=motion_worker, args=(picam2, encoder), daemon=True).start()
-    threading.Thread(target=idle_monitor, daemon=True).start()
-
-    notifier.notify("READY=1")
-
     prev_frame = None
+    last_motion_time = 0
+    is_recording = False
+
     try:
         while True:
-            notifier.notify("WATCHDOG=1")
             frame = picam2.capture_array()
             gray = cv2.cvtColor(frame, cv2.COLOR_YUV420p2GRAY)
+
             if prev_frame is None:
                 prev_frame = gray
                 continue
 
-            delta = cv2.absdiff(prev_frame, gray)
-            _, thresh = cv2.threshold(delta, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
+            current_time = time.time()
+            if is_recording or (current_time - last_motion_time) < (VIDEO_DURATION + COOLDOWN_PERIOD):
+                time.sleep(0.1)
+                continue
+
+            frame_delta = cv2.absdiff(prev_frame, gray)
+            thresh = cv2.threshold(frame_delta, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
             thresh = cv2.dilate(thresh, None, iterations=2)
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            if any(cv2.contourArea(c) > MIN_MOTION_AREA for c in contours):
-                motion_queue.put(True)
+            motion_detected = any(cv2.contourArea(c) > MIN_MOTION_AREA for c in contours)
 
-            prev_frame = gray
-            time.sleep(0.05)
-    except:
-        shutdown(None, None)
+            prev_frame = gray.copy()
+
+            if motion_detected and not is_recording:
+                is_recording = True
+                last_motion_time = current_time
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                video_path = os.path.join(OUTPUT_DIR, f"motion_{timestamp}.h264")
+                print(f"Motion triggered recording: {video_path}")
+
+                threading.Thread(target=handle_motion, args=(picam2, encoder, video_path)).start()
+
+                time.sleep(0.1)
+                is_recording = False
+
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        picam2.stop()
+        picam2.close()
 
 if __name__ == "__main__":
     main()
+#end
